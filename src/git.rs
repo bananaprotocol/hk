@@ -15,9 +15,22 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use xx::file::display_path;
 
 use crate::env;
+
+#[cfg(unix)]
+fn set_file_mode(path: &std::path::Path, mode: u32) {
+    let perms = std::fs::Permissions::from_mode(mode & 0o777);
+    if let Err(err) = std::fs::set_permissions(path, perms) {
+        warn!(
+            "failed to set permissions for {}: {err:?}",
+            display_path(&path.to_path_buf())
+        );
+    }
+}
 
 fn git_cmd<I, S>(args: I) -> xx::process::XXExpression
 where
@@ -965,13 +978,33 @@ impl Git {
                             "cat-file",
                             "-p",
                             &format!("{}^3:{}", &stash_ref, path_str),
-                        ]) && let Err(err) = xx::file::write(&path, &contents)
-                        {
-                            warn!(
-                                "failed to write untracked file {}: {err:?}",
-                                display_path(&path)
-                            );
-                            restoration_failed = true;
+                        ]) {
+                            if let Err(err) = xx::file::write(&path, &contents) {
+                                warn!(
+                                    "failed to write untracked file {}: {err:?}",
+                                    display_path(&path)
+                                );
+                                restoration_failed = true;
+                            } else {
+                                #[cfg(unix)]
+                                {
+                                    let untracked_mode = git_cmd([
+                                        "ls-tree",
+                                        &format!("{}^3", &stash_ref),
+                                        "--",
+                                        &path_str,
+                                    ])
+                                    .read()
+                                    .ok()
+                                    .and_then(|s| {
+                                        s.split_whitespace()
+                                            .next()
+                                            .and_then(|m| u32::from_str_radix(m, 8).ok())
+                                    })
+                                    .unwrap_or(0o100644);
+                                    set_file_mode(&path, untracked_mode);
+                                }
+                            }
                         }
                         // Skip normal merge path for untracked files
                         continue;
